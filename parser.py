@@ -6,10 +6,14 @@ from bs4 import BeautifulSoup
 conn = sqlite3.connect('eshopy.db')
 cursor = conn.cursor()
 
+
+# Úsek kódu v parser.py, který musíš opravit:
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS seznam_eshopu (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        domena TEXT UNIQUE
+        domena TEXT UNIQUE,
+        status TEXT DEFAULT 'novy',
+        telefon TEXT
     )
 ''')
 conn.commit()
