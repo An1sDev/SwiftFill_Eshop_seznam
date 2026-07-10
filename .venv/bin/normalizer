@@ -1,4 +1,4 @@
-#!/home/an1sdev/Documents/GitHub/SwiftFill_seznam/.venv/bin/python3
+#!/home/tritonit/Documents/GitHub/SwiftFill_seznam/.venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys
