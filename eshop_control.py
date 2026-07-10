@@ -15,10 +15,10 @@ CLOUDS = [
     "shoptet", "shopify", "upgates", "fastcentrik", "myshoptet", "webnode", "wix", "squarespace", "byznysweb", "bizweb", 
     "eshop-rychle"
 ]
-CARTS=["kosik", "košík", "cart", "checkout", "objednavka"]
+CARTS = ["kosik", "košík", "cart", "checkout", "objednavka"]
 cizi_validatory = ["foxentry", "maps.googleapis.com", "loqate", "addressy", "places.js", "google.maps", "api.mapy.cz"]
 
-# Limit concurrency to avoid getting IP-blocked or crashing your system
+
 CONCURRENCY_LIMIT = 20
 timeout_config = aiohttp.ClientTimeout(total=6)
 
@@ -86,7 +86,8 @@ async def is_valid_eshop_target_async(session, url):
     # 2. KROK: Platform checks (Run concurrently)
     task_woo = probe_path_async(session, url, "/wp-content/plugins/woocommerce/", "woocommerce")
     task_presta_1 = probe_path_async(session, url, "/modules/blockcart/", "blockcart")
-    task_presta_2 = probe_path_async(session, url, "/img/p/", "vlastni_overeni")
+    # OPRAVENO: Změněno z nefunkčního /img/p/ na globální core.js
+    task_presta_2 = probe_path_async(session, url, "/themes/core.js", "prestashop")
     
     je_woocommerce, je_prestashop_1, je_prestashop_2 = await asyncio.gather(task_woo, task_presta_1, task_presta_2)
     je_prestashop = je_prestashop_1 or je_prestashop_2
@@ -153,15 +154,22 @@ async def is_valid_eshop_target_async(session, url):
     except Exception:
         pass
 
-    
+    eshop_znaky = ["koupit", "přidat do košíku", "do košíku", "skladem", "cena s dph", "včetně dph", "cart", "basket"]
+    if platforma == "Vlastní / Jiná platforma":
+        if not any(znak in kompletni_text for znak in eshop_znaky):
+            return False, "Není e-shop (Absence nákupních frází)"
+
     ma_jiny_validator = any(v in kompletni_text for v in cizi_validatory)
     ma_smartform = "smartform" in kompletni_text
 
     if ma_smartform:
-        platforma += " + Smartform"
+        platforma = "Využívá SmartForm"
 
     if ma_jiny_validator and not ma_smartform:
         return False, "Cizí validátor (Detekován v kódu/GTM)"
+    
+    if platforma == "Vlastní / Jiná platforma" and not url_pokladny:
+            return False, "Není e-shop (Nenalezen košík)"
 
     return True, platforma
 
@@ -169,16 +177,18 @@ async def is_valid_eshop_target_async(session, url):
 async def worker(queue, session, cursor_dst, conn_dst):
     """Worker process that pulls jobs from queue and writes directly to SQLite"""
     while True:
-        eshop_id, domena = await queue.get()
+        # UPRAVENO: Z fronty vytahujeme kompletní balík dat včetně telefonu a emailu
+        eshop_id, domena, telefon, email = await queue.get()
         url = domena if domena.startswith("http") else f"https://www.{domena}"
         
         try:
             prosel, vysledek = await is_valid_eshop_target_async(session, url)
             if prosel:
                 print(f"[+] PROŠEL: {domena} ({vysledek})")
+                # UPRAVENO: Zapisujeme doménu, telefon i e-mail (použity 3 otazníky a správný tuple)
                 cursor_dst.execute(
-                    'INSERT OR IGNORE INTO schvalene (domena) VALUES (?)', 
-                    (domena,)
+                    'INSERT OR IGNORE INTO schvalene (domena, telefon, email) VALUES (?, ?, ?)', 
+                    (domena, telefon, email)
                 )
                 conn_dst.commit()
             else:
@@ -204,22 +214,25 @@ async def main():
         CREATE TABLE IF NOT EXISTS schvalene (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             domena TEXT UNIQUE,
-            telefon TEXT
+            telefon TEXT,
+            email TEXT UNIQUE
         )
     ''')
     conn_dst.commit()
     
     try:
-        cursor_src.execute("SELECT id, domena FROM seznam_eshopu")
+        # UPRAVENO: Vytahujeme z původní databáze i sloupce telefon a email
+        # (Pokud se v původní DB jmenují jinak než 'telefon' a 'email', uprav názvy v SELECTu)
+        cursor_src.execute("SELECT id, domena, telefon, email FROM seznam_eshopu")
         eshopy = cursor_src.fetchall()
     except sqlite3.OperationalError:
-        print("[!] Zdrojová tabulka neexistuje.")
+        print("[!] Zdrojová tabulka neexistuje nebo neobsahuje sloupce telefon/email.")
         return
 
     # Set up async execution queue
     queue = asyncio.Queue()
     for item in eshopy:
-        await queue.put(item)
+        await queue.put(item)  # Do fronty padá celý tuple (id, domena, telefon, email)
 
     async with aiohttp.ClientSession() as session:
         # Fire up parallel worker tasks
