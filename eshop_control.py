@@ -1,8 +1,9 @@
 import os
 import re
 import sqlite3
-import dns.resolver
-import requests
+import asyncio
+import dns.asyncresolver
+import aiohttp
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 
@@ -10,24 +11,37 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8"
 }
+CLOUDS = [
+    "shoptet", "shopify", "upgates", "fastcentrik", "myshoptet", "webnode", "wix", "squarespace", "byznysweb", "bizweb", 
+    "eshop-rychle"
+]
+CARTS=["kosik", "košík", "cart", "checkout", "objednavka"]
+cizi_validatory = ["foxentry", "maps.googleapis.com", "loqate", "addressy", "places.js", "google.maps", "api.mapy.cz"]
 
-def check_dns_cloud(domain):
-    """Kontrola DNS záznamů na přítomnost známých cloudů"""
+# Limit concurrency to avoid getting IP-blocked or crashing your system
+CONCURRENCY_LIMIT = 20
+timeout_config = aiohttp.ClientTimeout(total=6)
+
+async def check_dns_cloud_async(domain):
+    """Async DNS check for known clouds"""
+    resolver = dns.asyncresolver.Resolver()
+    resolver.timeout = 2
+    resolver.lifetime = 2
     try:
         try:
-            answers = dns.resolver.resolve(domain, 'CNAME')
+            answers = await resolver.resolve(domain, 'CNAME')
             for rdata in answers:
                 cname = str(rdata.target).lower()
-                if any(cloud in cname for cloud in ["shoptet", "shopify", "upgates", "fastcentrik", "myshoptet"]):
+                if any(cloud in cname for cloud in CLOUDS):
                     return True, f"Cloud CNAME ({cname})"
-        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        except Exception:
             pass
 
         try:
-            answers = dns.resolver.resolve(domain, 'A')
+            answers = await resolver.resolve(domain, 'A')
             for rdata in answers:
                 ip = str(rdata)
-                if ip.startswith("185.83."):  # Shoptet IP rozsah
+                if ip.startswith("185.83."):
                     return True, "Shoptet IP adresa"
         except Exception:
             pass
@@ -35,28 +49,21 @@ def check_dns_cloud(domain):
         pass
     return False, ""
 
-def probe_path_secure(base_url, path, unique_substring):
-    """
-    OPRAVENO: Bezpečnější kontrola existence platformy.
-    Nestačí status 200/403, musíme v HTML/JS ověřit existenci specifického řetězce,
-    abychom eliminovali weby, které na neexistující cestu vrací homepage (Alza, Allegro).
-    """
+async def probe_path_async(session, base_url, path, unique_substring):
+    """Async content-verified platform check"""
     try:
         url = urljoin(base_url, path)
-        # Použijeme GET místo HEAD, abychom mohli zkontrolovat obsah
-        response = requests.get(url, headers=HEADERS, timeout=4, allow_redirects=True)
-        
-        if response.status_code == 200:
-            # Pokud web vrátil 200, ověříme, že to není podvržená homepage,
-            # ale skutečně hledaný skript/složka
-            if unique_substring.lower() in response.text.lower():
-                return True
+        async with session.get(url, headers=HEADERS, timeout=timeout_config, allow_redirects=True) as response:
+            if response.status == 200:
+                text = await response.text()
+                if unique_substring.lower() in text.lower():
+                    return True
     except Exception:
         pass
     return False
 
 def najdi_podstranku(soup, base_url, klicova_slova):
-    """Pomocná funkce pro vyhledání odkazu na pokladnu v HTML"""
+    """Helper to find checkout/cart links"""
     for link in soup.find_all('a', href=True):
         href = link['href'].lower()
         text = link.get_text().lower()
@@ -66,22 +73,23 @@ def najdi_podstranku(soup, base_url, klicova_slova):
             return urljoin(base_url, link['href'])
     return None
 
-def is_valid_eshop_target(url):
-    """
-    HLAVNÍ FILTRAČNÍ FUNKCE (Gatekeeper) - BEZ PLAYWRIGHTU
-    """
+async def is_valid_eshop_target_async(session, url):
+    """Main Gatekeeper analysis - Non-blocking async"""
     parsed_url = urlparse(url)
     domain = parsed_url.netloc
     
-    # 1. KROK: DNS Kontrola na cloudy
-    je_cloud, duvod_cloudu = check_dns_cloud(domain)
+    # 1. KROK: DNS Kontrola
+    je_cloud, duvod_cloudu = await check_dns_cloud_async(domain)
     if je_cloud:
         return False, f"Cloud ({duvod_cloudu})"
 
-    # 2. KROK: Detekce platformy pomocí ověření obsahu (Zde opraveno o substringy)
-    je_woocommerce = probe_path_secure(url, "/wp-content/plugins/woocommerce/", "woocommerce")
-    je_prestashop = (probe_path_secure(url, "/modules/blockcart/", "blockcart") or 
-                     probe_path_secure(url, "/img/p/", "vlastni_overeni_nebo_nechat_jen_skripty")) # Lepší cílit na js/css
+    # 2. KROK: Platform checks (Run concurrently)
+    task_woo = probe_path_async(session, url, "/wp-content/plugins/woocommerce/", "woocommerce")
+    task_presta_1 = probe_path_async(session, url, "/modules/blockcart/", "blockcart")
+    task_presta_2 = probe_path_async(session, url, "/img/p/", "vlastni_overeni")
+    
+    je_woocommerce, je_prestashop_1, je_prestashop_2 = await asyncio.gather(task_woo, task_presta_1, task_presta_2)
+    je_prestashop = je_prestashop_1 or je_prestashop_2
     
     if je_woocommerce:
         platforma = "WooCommerce"
@@ -90,134 +98,145 @@ def is_valid_eshop_target(url):
     else:
         platforma = "Vlastní / Jiná platforma"
         
-    # Pokud je to vlastní platforma, zkontrolujeme, zda to není velké Magento Enterprise
     if platforma == "Vlastní / Jiná platforma":
-        if probe_path_secure(url, "/errors/design.xml", "magento") or probe_path_secure(url, "/media/catalog/", "catalog"):
+        task_mag_1 = probe_path_async(session, url, "/errors/design.xml", "magento")
+        task_mag_2 = probe_path_async(session, url, "/media/catalog/", "catalog")
+        je_mag1, je_mag2 = await asyncio.gather(task_mag_1, task_mag_2)
+        if je_mag1 or je_mag2:
             return False, "Magento Enterprise"
 
-    # 3. KROK: Kontrola Smartformu a skrytých validátorů (včetně GTM scriptů)
+    # 3. KROK: Scrape text and scan GTM
     kompletni_text = ""
     gtm_ids = set()
 
     try:
-        # Stáhneme hlavní stránku
-        r_hp = requests.get(url, headers=HEADERS, timeout=5)
-        html_hp = r_hp.text.lower()
-        kompletni_text += html_hp
+        async with session.get(url, headers=HEADERS, timeout=timeout_config) as r_hp:
+            html_hp = await r_hp.text(errors='ignore')
+            html_hp = html_hp.lower()
+            kompletni_text += html_hp
         
-        # Vytáhneme případná GTM ID z HP
         found_gtm = re.findall(r'gtm-[a-zA-Z0-9]+', html_hp)
         if found_gtm:
             gtm_ids.update([g.upper() for g in found_gtm])
         
-        # Pokusíme se najít odkaz do košíku
         soup_hp = BeautifulSoup(html_hp, 'html.parser')
-        url_pokladny = najdi_podstranku(soup_hp, url, ["kosik", "košík", "cart", "checkout", "objednavka"])
+        url_pokladny = najdi_podstranku(soup_hp, url, CARTS)
         
-        # Pokud košík existuje, stáhneme ho celý (ne jen 40kb, skripty bývají na konci!)
         if url_pokladny:
-            r_p = requests.get(url_pokladny, headers=HEADERS, timeout=5)
-            html_p = r_p.text.lower()
-            kompletni_text += " " + html_p
-            
-            # Vytáhneme GTM ID i z košíku
+            async with session.get(url_pokladny, headers=HEADERS, timeout=timeout_config) as r_p:
+                html_p = await r_p.text(errors='ignore')
+                html_p = html_p.lower()
+                kompletni_text += " " + html_p
+                
             found_gtm_p = re.findall(r'gtm-[a-zA-Z0-9]+', html_p)
             if found_gtm_p:
                 gtm_ids.update([g.upper() for g in found_gtm_p])
                 
-        # Proskenujeme samotné vnitřky Google Tag Manager kontejnerů
-        for gtm_id in gtm_ids:
+        # Fetch GTM scripts asynchronously
+        async def fetch_gtm(gtm_id):
             try:
-                r_gtm = requests.get(f"https://www.googletagmanager.com/gtm.js?id={gtm_id}", headers=HEADERS, timeout=4)
-                if r_gtm.status_code == 200:
-                    gtm_text = r_gtm.text.lower()
-                    kompletni_text += " " + gtm_text
-                    
-                    # Zkusíme v GTM textu najít zmínky o foxentry skriptech, i když jsou schované v řetězci.
-                    if "foxentry" in gtm_text:
-                        kompletni_text += " foxentry "
+                gtm_url = f"https://www.googletagmanager.com/gtm.js?id={gtm_id}"
+                async with session.get(gtm_url, headers=HEADERS, timeout=timeout_config) as r_gtm:
+                    if r_gtm.status == 200:
+                        return await r_gtm.text()
             except:
                 pass
+            return ""
+
+        gtm_results = await asyncio.gather(*(fetch_gtm(g_id) for g_id in gtm_ids))
+        for gtm_text in gtm_results:
+            if gtm_text:
+                kompletni_text += " " + gtm_text.lower()
+                if "foxentry" in gtm_text.lower():
+                    kompletni_text += " foxentry "
 
     except Exception:
         pass
 
-    # Vyhodnocení validátorů
-    cizi_validatory = ["foxentry", "maps.googleapis.com", "loqate", "addressy", "places.js", "google.maps", "api.mapy.cz"]
+    
     ma_jiny_validator = any(v in kompletni_text for v in cizi_validatory)
     ma_smartform = "smartform" in kompletni_text
 
     if ma_smartform:
         platforma += " + Smartform"
 
-    # Pokud má cizí validátor a NEMÁ Smartform -> Vyřadit
     if ma_jiny_validator and not ma_smartform:
-        return False, f"Cizí validátor (Detekován v kódu/GTM)"
+        return False, "Cizí validátor (Detekován v kódu/GTM)"
 
     return True, platforma
 
 
-if __name__ == "__main__":
-    # Zjištění absolutní cesty k adresáři, kde leží tento skript
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    
-    # Sestavení absolutních cest k souborům databází
-    source_db_path = os.path.join(BASE_DIR, 'eshopy.db')
-    target_db_path = os.path.join(BASE_DIR, 'schvalene_eshopy.db')
-
-    # 1. Připojení ke zdrojové databázi (Surové domény z parseru)
-    conn_src = sqlite3.connect(source_db_path)
-    cursor_src = conn_src.cursor()
-    
-    # 2. Připojení k NOVÉ cílové databázi (Ukládáme jen schválené čisté kousky)
-    conn_dst = sqlite3.connect(target_db_path)
-    cursor_dst = conn_dst.cursor()
-    
-    # Vytvoříme v nové DB čistou tabulku (pokud neexistuje)
-    cursor_dst.execute('''
-        CREATE TABLE IF NOT EXISTS schvalene (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            domena TEXT UNIQUE,
-            platforma TEXT,
-            telefon TEXT
-        )
-    ''')
-    # Okamžitý commit vynutí, že soubor schvalene_eshopy.db fyzicky vznikne na disku hned teď
-    conn_dst.commit()
-    
-    # Vytáhneme e-shopy ze zdrojové DB
-    try:
-        cursor_src.execute("SELECT id, domena FROM seznam_eshopu")
-        eshopy = cursor_src.fetchall()
-    except sqlite3.OperationalError:
-        print(f"[!] Chyba: Tabulka 'seznam_eshopu' v databázi '{source_db_path}' neexistuje. Spusť nejprve parser.py.")
-        exit()
-    
-    print(f"=== SPUŠTĚNÍ FILTRACE (Gatekeeper) ===")
-    print(f"Zdrojová DB: {source_db_path}")
-    print(f"Cílová DB: {target_db_path}")
-    print(f"Načteno {len(eshopy)} domén ze zdrojové DB k prověření.\n" + "-"*50)
-    
-    for eshop_id, domena in eshopy:
+async def worker(queue, session, cursor_dst, conn_dst):
+    """Worker process that pulls jobs from queue and writes directly to SQLite"""
+    while True:
+        eshop_id, domena = await queue.get()
         url = domena if domena.startswith("http") else f"https://www.{domena}"
         
         try:
-            prosel, vysledek = is_valid_eshop_target(url)
-            
+            prosel, vysledek = await is_valid_eshop_target_async(session, url)
             if prosel:
-                print(f"[+] PROŠEL: {domena} ({vysledek}) -> Zapisuji do schvalene_eshopy.db")
-                # Zapíšeme e-shop do NOVÉ databáze. 'INSERT OR IGNORE' zajistí unikalitu
+                print(f"[+] PROŠEL: {domena} ({vysledek})")
                 cursor_dst.execute(
-                    'INSERT OR IGNORE INTO schvalene (domena, platforma) VALUES (?, ?)', 
-                    (domena, vysledek)
+                    'INSERT OR IGNORE INTO schvalene (domena) VALUES (?)', 
+                    (domena,)
                 )
                 conn_dst.commit()
             else:
                 print(f"[-] BLOKOVÁN: {domena} -> Důvod: {vysledek}")
-                
         except Exception as e:
-            print(f"[!] Chyba při analýze domény {domena}: {e}")
-            
+            print(f"[!] Chyba {domena}: {e}")
+        finally:
+            queue.task_done()
+
+
+async def main():
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    source_db_path = os.path.join(BASE_DIR, 'eshopy.db')
+    target_db_path = os.path.join(BASE_DIR, 'schvalene_eshopy.db')
+
+    conn_src = sqlite3.connect(source_db_path)
+    cursor_src = conn_src.cursor()
+    
+    conn_dst = sqlite3.connect(target_db_path)
+    cursor_dst = conn_dst.cursor()
+    
+    cursor_dst.execute('''
+        CREATE TABLE IF NOT EXISTS schvalene (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domena TEXT UNIQUE,
+            telefon TEXT
+        )
+    ''')
+    conn_dst.commit()
+    
+    try:
+        cursor_src.execute("SELECT id, domena FROM seznam_eshopu")
+        eshopy = cursor_src.fetchall()
+    except sqlite3.OperationalError:
+        print("[!] Zdrojová tabulka neexistuje.")
+        return
+
+    # Set up async execution queue
+    queue = asyncio.Queue()
+    for item in eshopy:
+        await queue.put(item)
+
+    async with aiohttp.ClientSession() as session:
+        # Fire up parallel worker tasks
+        tasks = []
+        for _ in range(CONCURRENCY_LIMIT):
+            task = asyncio.create_task(worker(queue, session, cursor_dst, conn_dst))
+            tasks.append(task)
+
+        await queue.join()
+
+        # Cancel workers when queue is empty
+        for task in tasks:
+            task.cancel()
+
     conn_src.close()
     conn_dst.close()
-    print("-" * 50 + f"\nFiltrace dokončena. Čistá data uložena v '{target_db_path}'.")
+    print("Filtrace dokončena.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
