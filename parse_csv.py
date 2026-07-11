@@ -1,145 +1,292 @@
-import sqlite3
-import re
 import os
-import sys
+import re
+import sqlite3
+import asyncio
+import dns.asyncresolver
+import aiohttp
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin
 
-# --- CONFIG ---
-CSV_FILE = 'Firma.csv'
-DB_FILE = 'eshopy.db'
-
-# --- 1. Inicializace DB a kontrola struktury ---
-conn = sqlite3.connect(DB_FILE, timeout=60)
-cursor = conn.cursor()
-
-# Vytvoření tabulky, pokud neexistuje
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS seznam_eshopu (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        domena TEXT UNIQUE,
-        telefon TEXT,
-        email TEXT
-    )
-''')
-conn.commit()
-
-# Pojistka: Pokud by sloupec email chyběl ve staré DB
-try:
-    cursor.execute('ALTER TABLE seznam_eshopu ADD COLUMN email TEXT')
-    conn.commit()
-except sqlite3.OperationalError:
-    pass
-
-# --- 2. Regexy upravené přesně pro tvůj formát textu ---
-
-# Vyhledá hodnotu v uvozovkách hned za "Web":"
-web_regex = re.compile(r'"Web"\s*:\s*"([^"]+)"', re.IGNORECASE)
-
-# Vyhledá hodnotu v uvozovkách hned za "Email":"
-email_regex = re.compile(r'"Email"\s*:\s*"([^"]+)"', re.IGNORECASE)
-
-# Vyhledá hodnotu v uvozovkách hned za "Telefon":"
-phone_regex = re.compile(r'"Telefon"\s*:\s*"([^"]+)"', re.IGNORECASE)
-
-# Pomocný regex pro ořezání domény na čistý tvar
-domain_cleaner = re.compile(r'(?:https?://)?(?:www\.)?([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)', re.IGNORECASE)
-
-# Seznam neplatných hodnot / systémových domén
-DOMAIN_BLACKLIST = {
-    's.r.o', 'z.s', 'a.s', 'v.o.s', 'k.s', 'seznam.cz', 'gmail.com', 
-    'email.cz', 'centrum.cz', 'volny.cz', 'outlook.com', 'post.cz'
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8"
 }
+CLOUDS = [
+    "shoptet", "shopify", "upgates", "fastcentrik", "myshoptet", "webnode", "wix", "squarespace", "byznysweb", "bizweb",
+    "eshop-rychle"
+]
+CARTS = ["kosik", "košík", "cart", "checkout", "objednavka"]
+cizi_validatory = ["foxentry", "maps.googleapis.com", "loqate", "addressy", "places.js", "google.maps", "api.mapy.cz"]
 
-def get_clean_domain(row_text):
-    web_match = web_regex.search(row_text)
-    if web_match:
-        raw_web = web_match.group(1).strip().lower()
-        
-        # Očistíme od http, https, www a lomítek
-        clean_match = domain_cleaner.search(raw_web)
-        if clean_match:
-            domain = clean_match.group(1)
-            if domain.startswith('www.'):
-                domain = domain[4:]
-            domain = domain.split('/')[0]
-            
-            # Odfiltrujeme nesmysly a příliš krátké domény
-            if domain in DOMAIN_BLACKLIST or len(domain.split('.')) < 2:
-                return None
-            return domain
+CONCURRENCY_LIMIT = 20
+timeout_config = aiohttp.ClientTimeout(total=6)
+
+
+async def check_dns_cloud_async(domain):
+    resolver = dns.asyncresolver.Resolver()
+    resolver.timeout = 2
+    resolver.lifetime = 2
+    try:
+        try:
+            answers = await resolver.resolve(domain, 'CNAME')
+            for rdata in answers:
+                cname = str(rdata.target).lower()
+                if any(cloud in cname for cloud in CLOUDS):
+                    return True, f"Cloud CNAME ({cname})"
+        except Exception:
+            pass
+
+        try:
+            answers = await resolver.resolve(domain, 'A')
+            for rdata in answers:
+                ip = str(rdata)
+                if ip.startswith("185.83."):
+                    return True, "Shoptet IP adresa"
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False, ""
+
+
+async def probe_path_async(session, base_url, path, unique_substring):
+    try:
+        url = urljoin(base_url, path)
+        async with session.get(url, headers=HEADERS, timeout=timeout_config, allow_redirects=True) as response:
+            if response.status == 200:
+                text = await response.text()
+                if unique_substring.lower() in text.lower():
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def najdi_podstranku(soup, base_url, klicova_slova):
+    for link in soup.find_all('a', href=True):
+        href = link.get('href', '').lower()
+        text = link.get_text().lower()
+        if any(slovo in href or slovo in text for slovo in klicova_slova):
+            if any(x in href for x in ["javascript:", "mailto:", "tel:", "#"]):
+                continue
+            return urljoin(base_url, link['href'])
     return None
 
-def get_clean_email(row_text):
-    email_match = email_regex.search(row_text)
-    if email_match:
-        email = email_match.group(1).strip().lower()
-        # Pokud je pole prázdné (např. "") nebo obsahuje jen smetí, vrátíme None
-        if email and '@' in email:
-            return email
-    return None
 
-def get_clean_phone(row_text):
-    phone_match = phone_regex.search(row_text)
-    if phone_match:
-        phone = phone_match.group(1).strip()
-        # Odstraníme mezery (z "234 602 209" udělá "234602209")
-        phone = phone.replace(" ", "")
-        if phone:
-            return phone
-    return None
+async def is_valid_eshop_target_async(session, url):
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc
 
-# --- 3. Spuštění importu ---
-if not os.path.exists(CSV_FILE):
-    print(f"❌ Soubor {CSV_FILE} nebyl nalezen v aktuální složce!")
-    sys.exit(1)
+    je_cloud, duvod_cloudu = await check_dns_cloud_async(domain)
+    if je_cloud:
+        return False, f"Cloud ({duvod_cloudu})"
 
-print(f"Spouštím precizní extrakci dat ze souboru {CSV_FILE}...")
-print("-" * 50)
+    task_woo = probe_path_async(session, url, "/wp-content/plugins/woocommerce/", "woocommerce")
+    task_presta_1 = probe_path_async(session, url, "/modules/blockcart/", "blockcart")
+    task_presta_2 = probe_path_async(session, url, "/themes/core.js", "prestashop")
 
-inserted_count = 0
-updated_count = 0
-skipped_count = 0
+    je_woocommerce, je_prestashop_1, je_prestashop_2 = await asyncio.gather(task_woo, task_presta_1, task_presta_2)
+    je_prestashop = je_prestashop_1 or je_prestashop_2
 
-# Čtení jako surový text po řádcích (UTF-16 podle předchozího zjištění)
-with open(CSV_FILE, mode='r', encoding='utf-16', errors='ignore') as f:
-    for row_id, line in enumerate(f, 1):
-        if not line.strip():
-            continue
-            
-        domain = get_clean_domain(line)
-        email = get_clean_email(line)
-        phone = get_clean_phone(line)
-        
-        if domain:
+    if je_woocommerce:
+        platforma = "WooCommerce"
+    elif je_prestashop:
+        platforma = "PrestaShop"
+    else:
+        platforma = "Vlastní / Jiná platforma"
+
+    if platforma == "Vlastní / Jiná platforma":
+        task_mag_1 = probe_path_async(session, url, "/errors/design.xml", "magento")
+        task_mag_2 = probe_path_async(session, url, "/media/catalog/", "catalog")
+        je_mag1, je_mag2 = await asyncio.gather(task_mag_1, task_mag_2)
+        if je_mag1 or je_mag2:
+            return False, "Magento Enterprise"
+
+    kompletni_text = ""
+    gtm_ids = set()
+
+    try:
+        async with session.get(url, headers=HEADERS, timeout=timeout_config) as r_hp:
+            html_hp = await r_hp.text(errors='ignore')
+            html_hp = html_hp.lower()
+            kompletni_text += html_hp
+
+        found_gtm = re.findall(r'gtm-[a-zA-Z0-9]+', html_hp)
+        if found_gtm:
+            gtm_ids.update([g.upper() for g in found_gtm])
+
+        soup_hp = BeautifulSoup(html_hp, 'html.parser')
+        url_pokladny = najdi_podstranku(soup_hp, url, CARTS)
+
+        if url_pokladny:
+            async with session.get(url_pokladny, headers=HEADERS, timeout=timeout_config) as r_p:
+                html_p = await r_p.text(errors='ignore')
+                html_p = html_p.lower()
+                kompletni_text += " " + html_p
+
+            found_gtm_p = re.findall(r'gtm-[a-zA-Z0-9]+', html_p)
+            if found_gtm_p:
+                gtm_ids.update([g.upper() for g in found_gtm_p])
+
+        async def fetch_gtm(gtm_id):
             try:
-                # Vložení s aktualizací chybějících polí (ON CONFLICT)
-                cursor.execute('''
-                    INSERT INTO seznam_eshopu (domena, telefon, email) 
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(domena) DO UPDATE SET
-                        telefon = COALESCE(seznam_eshopu.telefon, EXCLUDED.telefon),
-                        email = COALESCE(seznam_eshopu.email, EXCLUDED.email)
-                ''', (domain, phone, email))
-                
-                if cursor.rowcount == 1:
-                    inserted_count += 1
+                gtm_url = f"https://www.googletagmanager.com/gtm.js?id={gtm_id}"
+                async with session.get(gtm_url, headers=HEADERS, timeout=timeout_config) as r_gtm:
+                    if r_gtm.status == 200:
+                        return await r_gtm.text()
+            except:
+                pass
+            return ""
+
+        gtm_results = await asyncio.gather(*(fetch_gtm(g_id) for g_id in gtm_ids))
+        for gtm_text in gtm_results:
+            if gtm_text:
+                kompletni_text += " " + gtm_text.lower()
+                if "foxentry" in gtm_text.lower():
+                    kompletni_text += " foxentry "
+
+    except Exception:
+        pass
+
+    eshop_znaky = ["koupit", "přidat do košíku", "do košíku", "skladem", "cena s dph", "včetně dph", "cart", "basket"]
+    if platforma == "Vlastní / Jiná platforma":
+        if not any(znak in kompletni_text for znak in eshop_znaky):
+            return False, "Není e-shop (Absence nákupních frází)"
+
+    ma_jiny_validator = any(v in kompletni_text for v in cizi_validatory)
+    ma_smartform = "smartform" in kompletni_text
+
+    if ma_smartform:
+        platforma = "Využívá SmartForm"
+
+    if ma_jiny_validator and not ma_smartform:
+        return False, "Cizí validátor (Detekován v kódu/GTM)"
+
+    if platforma == "Vlastní / Jiná platforma" and not url_pokladny:
+        return False, "Není e-shop (Nenalezen košík)"
+
+    return True, platforma
+
+
+async def worker(queue, session, conn_dst, db_lock):
+    while True:
+        eshop_id, domena, telefon, email = await queue.get()
+        url = domena if domena.startswith("http") else f"https://www.{domena}"
+
+        try:
+            prosel, vysledek = await is_valid_eshop_target_async(session, url)
+
+            # Bezpečné zamknutí databáze proti chybě 0xC0000005
+            async with db_lock:
+                cursor_dst = conn_dst.cursor()
+                if prosel:
+                    print(f"[+] PROŠEL: {domena} ({vysledek}) [ID: {eshop_id}]")
+                    cursor_dst.execute(
+                        'INSERT OR IGNORE INTO schvalene (domena, telefon, email) VALUES (?, ?, ?)',
+                        (domena, telefon, email)
+                    )
                 else:
-                    updated_count += 1
-                    
-            except sqlite3.Error as e:
-                print(f"Chyba DB na řádku {row_id} ({domain}): {e}")
+                    print(f"[-] BLOKOVÁN: {domena} -> Důvod: {vysledek} [ID: {eshop_id}]")
+
+                conn_dst.commit()
+
+        except Exception as e:
+            print(f"[!] Chyba {domena} [ID: {eshop_id}]: {e}")
+        finally:
+            queue.task_done()
+
+
+async def main():
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    source_db_path = os.path.join(BASE_DIR, 'eshopy.db')
+    target_db_path = os.path.join(BASE_DIR, 'schvalene_eshopy.db')
+
+    conn_src = sqlite3.connect(source_db_path)
+    cursor_src = conn_src.cursor()
+
+    conn_dst = sqlite3.connect(target_db_path)
+    cursor_dst = conn_dst.cursor()
+
+    cursor_dst.execute('''
+        CREATE TABLE IF NOT EXISTS schvalene (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domena TEXT UNIQUE,
+            telefon TEXT,
+            email TEXT UNIQUE
+        )
+    ''')
+    conn_dst.commit()
+
+    # --- NOVÁ STRATEGIE NAVÁZÁNÍ ---
+    # 1. Zjistíme poslední úspěšně přidanou doménu z cílové databáze
+    cursor_dst.execute("SELECT domena FROM schvalene ORDER BY id DESC LIMIT 1")
+    posledni_schvalena_row = cursor_dst.fetchone()
+
+    start_id = 0
+    if posledni_schvalena_row:
+        posledni_domena = posledni_schvalena_row[0]
+
+        # 2. Najdeme její ID v původní zdrojové databázi eshopy.db
+        cursor_src.execute("SELECT id FROM seznam_eshopu WHERE domena = ?", (posledni_domena,))
+        zdrojovy_row = cursor_src.fetchone()
+
+        if zdrojovy_row:
+            start_id = zdrojovy_row[0]
+            print(f"▶️ Poslední uložený e-shop: {posledni_domena}")
+            print(f"▶️ Nalezené ID v původní DB: {start_id}")
         else:
-            skipped_count += 1
+            print(f"⚠️ Doména '{posledni_domena}' nebyla ve zdrojové DB nalezena. Jedu raději od nuly.")
+    else:
+        print("▶️ Cílová databáze je prázdná, začínám od začátku.")
 
-        # Průběžné info do konzole pro kontrolu každých 20 000 řádků
-        if row_id % 20000 == 0:
-            print(f" Zpracováno {row_id} řádků... (Aktuálně uloženo: {inserted_count})")
+    try:
+        # 3. Načteme pouze domény, které mají Vyšší ID než poslední zpracovaná doména
+        cursor_src.execute("SELECT id, domena, telefon, email FROM seznam_eshopu WHERE id > ? ORDER BY id ASC",
+                           (start_id,))
+        eshopy_k_zpracovani = cursor_src.fetchall()
 
-# Zápis do databáze
-conn.commit()
-conn.close()
+        cursor_src.execute("SELECT COUNT(*) FROM seznam_eshopu")
+        celkovy_pocet = cursor_src.fetchone()[0]
+    except sqlite3.OperationalError:
+        print("[!] Zdrojová tabulka neexistuje nebo neobsahuje sloupce telefon/email.")
+        return
 
-print("-" * 50)
-print(f"✅ Extrakce úspěšně dokončena!")
-print(f" - Nově přidané domény: {inserted_count}")
-print(f" - Aktualizované kontakty (doplněné k Heurece): {updated_count}")
-print(f" - Přeskočené řádky (bez platné domény): {skipped_count}")
+    print("-" * 50)
+    print(f"Celkem domén v eshopy.db: {celkovy_pocet}")
+    print(f"Přeskočeno řádků (včetně blokovaných): {start_id}")
+    print(f"Zbývá ke zpracování od místa pádu: {len(eshopy_k_zpracovani)}")
+    print("-" * 50)
+
+    if not eshopy_k_zpracovani:
+        print("Všechno už je zpracováno.")
+        conn_src.close()
+        conn_dst.close()
+        return
+
+    queue = asyncio.Queue()
+    for item in eshopy_k_zpracovani:
+        await queue.put(item)
+
+    # Zámek pro databázi proti chybám přístupu do paměti
+    db_lock = asyncio.Lock()
+
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for _ in range(CONCURRENCY_LIMIT):
+            task = asyncio.create_task(worker(queue, session, conn_dst, db_lock))
+            tasks.append(task)
+
+        await queue.join()
+
+        for task_item in tasks:
+            task_item.cancel()
+
+    conn_src.close()
+    conn_dst.close()
+    print("Filtrace dokončena.")
+
+
+if __name__ == "__main__":
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())
